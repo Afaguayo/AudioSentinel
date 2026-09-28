@@ -206,8 +206,8 @@ LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         std::wstring t1 = L"dB: " + std::to_wstring((int)db);
         std::wstring t2 = L"Allowance Used: " + std::to_wstring((int)exposure) + L"%";
 
-        TextOut(hdc, 20, 10, t1.c_str(), t1.length());
-        TextOut(hdc, 20, 30, t2.c_str(), t2.length());
+        TextOut(hdc, 20, 10, t1.c_str(), (int)t1.length());
+        TextOut(hdc, 20, 30, t2.c_str(), (int)t2.length());
 
         int graphTop = 60;
         int graphHeight = 60;
