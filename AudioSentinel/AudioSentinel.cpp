@@ -1,5 +1,13 @@
-// AudioSentinel.cpp : This file contains the 'main' function. Program execution begins and ends there.
+// AudioSentinel: a Windows tray app that measures how loud the audio your PC
+// is playing is, and how much of a day's safe-listening allowance you've used
+// (85 dB for 8 hours, halving for every 3 dB louder).
 //
+// - AudioThread captures the default output device in WASAPI loopback mode,
+//   turns each buffer's RMS level into an estimated dB value, smooths it, and
+//   adds elapsed time / safe time to the running exposure.
+// - Left-click the tray icon for a dashboard with the live level, allowance
+//   used, and a color-coded history graph (Up/Down arrows change opacity).
+//   Right-click the icon to quit; exposure is saved to exposure.dat.
 
 #include <windows.h>
 #include <shellapi.h>
@@ -198,8 +206,8 @@ LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         std::wstring t1 = L"dB: " + std::to_wstring((int)db);
         std::wstring t2 = L"Allowance Used: " + std::to_wstring((int)exposure) + L"%";
 
-        TextOut(hdc, 20, 10, t1.c_str(), t1.length());
-        TextOut(hdc, 20, 30, t2.c_str(), t2.length());
+        TextOut(hdc, 20, 10, t1.c_str(), (int)t1.length());
+        TextOut(hdc, 20, 30, t2.c_str(), (int)t2.length());
 
         int graphTop = 60;
         int graphHeight = 60;
@@ -325,14 +333,3 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
     return 0;
 }
-
-// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
-// Debug program: F5 or Debug > Start Debugging menu
-
-// Tips for Getting Started: 
-//   1. Use the Solution Explorer window to add/manage files
-//   2. Use the Team Explorer window to connect to source control
-//   3. Use the Output window to see build output and other messages
-//   4. Use the Error List window to view errors
-//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
-//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
