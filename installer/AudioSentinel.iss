@@ -1,8 +1,8 @@
 ; Inno Setup script for AudioSentinel.
-; Build the Release|x64 exe first, then: ISCC.exe /DAppVersion=1.0.0 installer\AudioSentinel.iss
+; Build the Release|x64 exe first, then: ISCC.exe /DAppVersion=1.1.0 installer\AudioSentinel.iss
 
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.1.0"
 #endif
 
 [Setup]

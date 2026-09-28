@@ -1030,7 +1030,7 @@ void HandleCommand(UINT id)
         break;
     case ID_ABOUT:
         MessageBoxW(g_dash && IsWindowVisible(g_dash) ? g_dash : nullptr,
-                    L"AudioSentinel 1.0\n\n"
+                    L"AudioSentinel 1.1\n\n"
                     L"Listens to what your PC plays and estimates how loud it is. Your daily "
                     L"allowance follows the NIOSH guideline: 85 dB for 8 hours, halved for every "
                     L"3 dB louder (88 dB = 4 h, 91 dB = 2 h, ...).\n\n"
