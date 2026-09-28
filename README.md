@@ -1,39 +1,68 @@
 # AudioSentinel
 
-A lightweight Windows tray app that keeps an eye on how loud the audio your PC is playing is, and how much of a day's safe-listening allowance you've used. It's written in C++ against the raw Win32 and Windows audio (WASAPI) APIs, with no frameworks.
+A small Windows tray app that watches how loud your PC's audio is and warns you before you use up your daily safe-listening allowance.
 
-## Use it
+![icon](AudioSentinel/AudioSentinel.ico)
 
-Download `AudioSentinel.exe` from [Releases](../../releases/latest), or build it yourself (below), and run it. An icon appears in the system tray:
+## Install
 
-- **Hover** to see the current level, e.g. `dB: 72`.
-- **Left-click** to open the dashboard: the live level, the % of today's allowance used, and a scrolling graph that's green below 80 dB, yellow from 80 to 90 dB, and red above 90 dB. **Up/Down arrow** keys change the dashboard's transparency.
-- **Right-click** to quit. Your running exposure is saved to `exposure.dat` next to the app and picked up again on the next launch.
+1. Download **`AudioSentinel-Setup-x.y.z.exe`** from the [latest release](https://github.com/Afaguayo/AudioSentinel/releases/latest).
+2. Run it. No admin rights are needed; it installs for your user only.
+3. Leave "Start AudioSentinel automatically when I sign in" ticked if you want it always on.
+
+Prefer no installer? Download `AudioSentinel-portable.exe` and run it from anywhere.
+
+> Windows SmartScreen may say "Windows protected your PC" because the exe isn't code-signed. Click **More info → Run anyway**.
+
+## Using it
+
+- The **tray icon** shows a dot for the current level (grey: silent, green: safe, amber: loud, red: harmful). A ring around it fills up as you use today's allowance.
+- **Left-click** the icon to open or hide the dashboard. It shows the current dB, how long you can keep listening at this level, today's allowance, and a graph of the last 2 minutes.
+- **Right-click** the icon, or the dashboard, for options:
+  - pause monitoring
+  - turn notifications on or off
+  - calibrate for your headphones/speakers
+  - keep on top
+  - start with Windows
+  - reset today's count
+  - exit
+- In the dashboard, **↑/↓** changes opacity and **Esc** hides it. Closing the window keeps the app running in the tray.
+
+You get a notification at **50%, 80% and 100%** of the daily allowance, plus a reminder every 30 minutes after that while you keep listening. You're also warned when audio stays above **95 dB** for 10 seconds.
 
 ## How it works
 
-1. **Capture:** a background thread opens the default playback device in WASAPI **loopback** mode, so it hears exactly what your speakers or headphones are being sent. It doesn't use a microphone.
-2. **Level:** for each buffer it computes the RMS of the samples, converts that to decibels (`20·log10(rms)`), adds a +100 offset to map it onto a familiar SPL-like scale, and smooths the result (exponential moving average, α = 0.2).
-3. **Exposure:** it uses the NIOSH rule that 85 dB is safe for 8 hours, and every 3 dB louder halves the safe time:
+- Captures what the default output device plays (WASAPI loopback) four times a second. It follows you when you switch devices.
+- Estimated level = signal level (dBFS) + Windows master volume + a calibration offset for how loud your output is. The offset is 90, 100 or 110 dB for the *Quiet*, *Typical* and *Loud* settings.
+- Daily allowance follows the NIOSH guideline: **85 dB for 8 hours**, halved for every 3 dB more (88 dB → 4 h, 91 dB → 2 h, 94 dB → 1 h…).
+- Counters reset at local midnight. They're saved to `%LOCALAPPDATA%\AudioSentinel\AudioSentinel.ini`, so a restart doesn't lose them.
 
-   ```text
-   safe hours = 8 × 2^((85 − dB) / 3)
-   ```
-
-   Every buffer adds `elapsed time ÷ safe time` to your exposure, so 100% means a full day's allowance.
+The dB figure is an estimate. Your PC can't know how efficient your headphones are, so set the calibration to match them.
 
 ## Limitations
 
-- **The dB value is an estimate.** It's based on the digital signal, so it doesn't know your volume knob, your headphones' sensitivity or your amplifier. Treat it as a relative gauge, not a calibrated meter.
-- **No pop-up alert yet.** It shows your level and allowance, but doesn't notify you when you pass 100%.
-- **The allowance doesn't reset daily.** `exposure.dat` keeps adding up until you delete it.
+- **The dB value is an estimate**, not a calibrated meter (see above). It measures what Windows sends to the device, not sound from other sources around you.
+- **Apps with exclusive-mode audio** (some games and pro audio tools) bypass the shared mixer and aren't counted while they hold the device.
+- **Windows only** (10 and 11, x64).
 
-## Build
+## Build from source
 
-Open `AudioSentinel.sln` in **Visual Studio 2022** (Desktop development with C++) and build **Release | x64**, or from a Developer Command Prompt:
+Requirements: Visual Studio 2022 with the *Desktop development with C++* workload.
 
-```bat
+```
 msbuild AudioSentinel.sln /p:Configuration=Release /p:Platform=x64
 ```
 
-The app is `x64\Release\AudioSentinel.exe`. GitHub Actions builds it on every push and attaches it to a release when a `v*` tag is pushed.
+Or open `AudioSentinel.sln` in Visual Studio and build **Release | x64**. The exe lands in `x64\Release\`. It links the C runtime statically, so it runs on any Windows 10/11 PC without extra installs.
+
+To build the installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run:
+
+```
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.0 installer\AudioSentinel.iss
+```
+
+The installer is written to `dist\`.
+
+**Releases:** pushing a tag like `v1.0.0` makes GitHub Actions build the exe and installer on Windows and attach both to a GitHub release.
+
+The icon is generated by `python3 tools/make_icon.py`, which needs only the standard library.
