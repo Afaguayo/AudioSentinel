@@ -363,3 +363,5 @@ MigrationBackup/
 FodyWeavers.xsd
 # Runtime data: your saved exposure
 exposure.dat
+# AudioSentinel
+dist/
