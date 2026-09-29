@@ -1,10 +1,13 @@
 // AudioSentinel: a tray app that estimates how loud your PC's audio output is
 // and how much of today's safe-listening allowance you have used.
 //
-// Exposure model: NIOSH recommendation of 85 dB for 8 hours with a 3 dB
-// exchange rate (every +3 dB halves the safe time). The loudness in dB SPL is
-// an estimate: the loopback signal level (dBFS) plus the Windows master volume,
-// plus an offset for how loud the user's headphones/speakers are.
+// This file is the Windows front end (Win32 + WASAPI + GDI+). The exposure
+// model, alerts, settings and Spotify title parsing live in ../core and are
+// shared with the Linux app.
+//
+//   AudioSentinel.exe                            start (shows the dashboard)
+//   AudioSentinel.exe --startup                  start in the tray (used at sign-in)
+//   AudioSentinel.exe --render-dashboard x.png   draw the dashboard with sample data
 
 #define NOMINMAX
 #include <windows.h>
@@ -26,11 +29,17 @@ using std::min;
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 #include "resource.h"
+#include "../core/dashboard.h"
+#include "../core/exposure.h"
+#include "../core/settings.h"
+#include "../core/spotify.h"
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -51,14 +60,8 @@ constexpr UINT WM_APP_SHOW = WM_APP + 2;
 constexpr UINT_PTR TIMER_TICK = 1;    // tray window, once per second
 constexpr UINT_PTR TIMER_REDRAW = 2;  // dashboard, while visible
 
-constexpr int TICKS_PER_SECOND = 4;
-constexpr int HISTORY_SECONDS = 120;
-constexpr size_t HISTORY_LEN = TICKS_PER_SECOND * HISTORY_SECONDS;
-
-constexpr double REF_DB = 85.0;      // level allowed for REF_HOURS per day
-constexpr double REF_HOURS = 8.0;
-constexpr double EXCHANGE_DB = 3.0;  // +3 dB halves the allowed time
-constexpr double LOUD_ALERT_DB = 95.0;
+constexpr int DASHBOARD_WIDTH = 440;
+constexpr int DASHBOARD_HEIGHT = 450;
 
 constexpr const wchar_t* APP_NAME = L"AudioSentinel";
 constexpr const wchar_t* TRAY_CLASS = L"AudioSentinelTray";
@@ -66,20 +69,18 @@ constexpr const wchar_t* DASH_CLASS = L"AudioSentinelDashboard";
 constexpr const wchar_t* MUTEX_NAME = L"Local\\AudioSentinel.Instance";
 constexpr const wchar_t* RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
-// dBFS -> estimated dB SPL offset for "Quiet", "Typical" and "Loud" outputs.
-constexpr double LOUDNESS_OFFSETS[] = { 90.0, 100.0, 110.0 };
-
 enum MenuId : UINT
 {
     ID_OPEN = 100,
     ID_PAUSE,
     ID_NOTIFY,
+    ID_SPOTIFY,
     ID_TOPMOST,
     ID_STARTUP,
     ID_RESET,
     ID_ABOUT,
     ID_EXIT,
-    ID_LOUD_0,  // ID_LOUD_0 + index into LOUDNESS_OFFSETS
+    ID_LOUD_0,  // ID_LOUD_0 + index into as::LOUDNESS_OFFSETS
     ID_LOUD_1,
     ID_LOUD_2,
 };
@@ -93,24 +94,21 @@ struct Shared
 {
     std::mutex lock;
     std::deque<float> history;  // smoothed dB, one sample per tick
-    double exposure = 0.0;      // fraction of today's allowance (1.0 = 100%)
-    double listenSeconds = 0.0; // time with audible output today
-    double peakDb = 0.0;
-    std::wstring date;          // local date the counters belong to
+    as::Tracker tracker;
 } g;
 
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_paused{ false };
 std::atomic<bool> g_deviceOk{ false };
+std::atomic<bool> g_spotifyPlaying{ false };
 std::atomic<double> g_db{ 0.0 };  // smoothed level for display
 std::atomic<int> g_loudness{ 1 };
 
-struct Settings
-{
-    bool notifications = true;
-    bool topmost = false;
-    int opacity = 96;  // percent
-} g_set;
+// UI thread only.
+as::Settings g_set;
+std::unique_ptr<as::IniFile> g_ini;
+as::AlertPolicy g_alerts;
+as::NowPlaying g_nowPlaying;
 
 HINSTANCE g_inst = nullptr;
 HWND g_tray = nullptr;
@@ -119,44 +117,29 @@ NOTIFYICONDATAW g_nid = {};
 HICON g_trayIcon = nullptr;
 int g_trayIconKey = -1;
 UINT g_taskbarCreated = 0;
-std::wstring g_ini;
-
-int g_alertLevel = 0;  // how many of ALERT_MARKS were already announced today
-int g_loudSeconds = 0;
-ULONGLONG g_lastLoudAlert = 0;
-ULONGLONG g_lastOverAlert = 0;
-
-const double ALERT_MARKS[] = { 0.5, 0.8, 1.0 };
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-double SafeHours(double db)
+std::wstring Wide(const std::string& s)
 {
-    return REF_HOURS * std::pow(2.0, (REF_DB - db) / EXCHANGE_DB);
+    if (s.empty())
+        return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+    return w;
 }
 
-std::wstring Today()
+std::string Utf8(const std::wstring& w)
 {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t buf[16];
-    swprintf_s(buf, L"%04u-%02u-%02u", st.wYear, st.wMonth, st.wDay);
-    return buf;
-}
-
-std::wstring FormatDuration(double hours)
-{
-    if (hours >= 24.0)
-        return L"more than 24 h";
-    int minutes = (int)(hours * 60.0);
-    if (minutes < 1)
-        return L"under 1 min";
-    if (minutes < 60)
-        return std::to_wstring(minutes) + L" min";
-    int h = minutes / 60, m = minutes % 60;
-    return std::to_wstring(h) + L" h " + std::to_wstring(m) + L" min";
+    if (w.empty())
+        return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
+    return s;
 }
 
 std::wstring StateDir()
@@ -178,69 +161,21 @@ std::wstring StateDir()
     return dir;
 }
 
-double IniGetDouble(const wchar_t* section, const wchar_t* key, double def)
-{
-    wchar_t buf[64];
-    GetPrivateProfileStringW(section, key, L"", buf, 64, g_ini.c_str());
-    return buf[0] ? _wtof(buf) : def;
-}
-
-int IniGetInt(const wchar_t* section, const wchar_t* key, int def)
-{
-    return (int)GetPrivateProfileIntW(section, key, def, g_ini.c_str());
-}
-
-void IniSet(const wchar_t* section, const wchar_t* key, const std::wstring& value)
-{
-    WritePrivateProfileStringW(section, key, value.c_str(), g_ini.c_str());
-}
-
 void LoadState()
 {
-    g_set.notifications = IniGetInt(L"Settings", L"Notifications", 1) != 0;
-    g_set.topmost = IniGetInt(L"Settings", L"Topmost", 0) != 0;
-    g_set.opacity = std::clamp(IniGetInt(L"Settings", L"Opacity", 96), 30, 100);
-    g_loudness = std::clamp(IniGetInt(L"Settings", L"Loudness", 1), 0, 2);
-
-    wchar_t date[32];
-    GetPrivateProfileStringW(L"Today", L"Date", L"", date, 32, g_ini.c_str());
-
+    g_ini->Load();
     std::lock_guard<std::mutex> lk(g.lock);
-    g.date = Today();
-    if (g.date == date)
-    {
-        g.exposure = IniGetDouble(L"Today", L"Exposure", 0.0);
-        g.listenSeconds = IniGetDouble(L"Today", L"ListenSeconds", 0.0);
-        g.peakDb = IniGetDouble(L"Today", L"PeakDb", 0.0);
-        g_alertLevel = IniGetInt(L"Today", L"Alerts", 0);
-    }
+    as::LoadState(*g_ini, as::Today(), g_set, g.tracker.stats);
+    g_loudness = g_set.loudness;
 }
 
 void SaveState()
 {
-    std::wstring date;
-    double exposure, listen, peak;
     {
         std::lock_guard<std::mutex> lk(g.lock);
-        date = g.date;
-        exposure = g.exposure;
-        listen = g.listenSeconds;
-        peak = g.peakDb;
+        as::StoreState(*g_ini, g_set, g.tracker.stats);
     }
-    wchar_t buf[64];
-    IniSet(L"Today", L"Date", date);
-    swprintf_s(buf, L"%.8f", exposure);
-    IniSet(L"Today", L"Exposure", buf);
-    swprintf_s(buf, L"%.1f", listen);
-    IniSet(L"Today", L"ListenSeconds", buf);
-    swprintf_s(buf, L"%.1f", peak);
-    IniSet(L"Today", L"PeakDb", buf);
-    IniSet(L"Today", L"Alerts", std::to_wstring(g_alertLevel));
-
-    IniSet(L"Settings", L"Notifications", g_set.notifications ? L"1" : L"0");
-    IniSet(L"Settings", L"Topmost", g_set.topmost ? L"1" : L"0");
-    IniSet(L"Settings", L"Opacity", std::to_wstring(g_set.opacity));
-    IniSet(L"Settings", L"Loudness", std::to_wstring(g_loudness.load()));
+    g_ini->Save();
 }
 
 bool IsStartupEnabled()
@@ -272,6 +207,56 @@ void SetStartup(bool enable)
         RegDeleteValueW(key, APP_NAME);
     }
     RegCloseKey(key);
+}
+
+// ---------------------------------------------------------------------------
+// Spotify: the desktop app titles its main window "Artist - Title" while
+// playing (see as::FromSpotifyWindowTitle).
+// ---------------------------------------------------------------------------
+
+bool IsSpotifyProcess(DWORD pid)
+{
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+        return false;
+    wchar_t path[MAX_PATH];
+    DWORD size = MAX_PATH;
+    bool ok = QueryFullProcessImageNameW(process, 0, path, &size) != FALSE;
+    CloseHandle(process);
+    if (!ok)
+        return false;
+    const wchar_t* name = wcsrchr(path, L'\\');
+    return _wcsicmp(name ? name + 1 : path, L"Spotify.exe") == 0;
+}
+
+BOOL CALLBACK FindSpotifyWindow(HWND hwnd, LPARAM result)
+{
+    if (GetWindowTextLengthW(hwnd) == 0)
+        return TRUE;
+    wchar_t cls[64];
+    GetClassNameW(hwnd, cls, 64);
+    if (wcsncmp(cls, L"Chrome_WidgetWin_", 17) != 0)  // Spotify is a Chromium app
+        return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!IsSpotifyProcess(pid))
+        return TRUE;
+    *reinterpret_cast<HWND*>(result) = hwnd;
+    return FALSE;
+}
+
+as::NowPlaying ReadSpotify()
+{
+    static HWND cached = nullptr;
+    if (cached && (!IsWindow(cached) || GetWindowTextLengthW(cached) == 0))
+        cached = nullptr;
+    if (!cached)
+        EnumWindows(FindSpotifyWindow, reinterpret_cast<LPARAM>(&cached));
+    if (!cached)
+        return {};
+    wchar_t title[512];
+    GetWindowTextW(cached, title, 512);
+    return as::FromSpotifyWindowTitle(Utf8(title));
 }
 
 // ---------------------------------------------------------------------------
@@ -465,15 +450,15 @@ void AudioThread()
         CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
 
         LoopbackCapture capture;
+        as::Smoother smoother;
         bool open = false;
         int ticksSinceDeviceCheck = 0;
         int ticksUntilRetry = 0;
-        double smoothed = 0.0;
         auto last = std::chrono::steady_clock::now();
 
         while (g_running)
         {
-            Sleep(1000 / TICKS_PER_SECOND);
+            Sleep(1000 / as::TICKS_PER_SECOND);
 
             auto now = std::chrono::steady_clock::now();
             // Cap dt so a resume from sleep doesn't count the whole gap.
@@ -484,7 +469,7 @@ void AudioThread()
             {
                 open = capture.Open(enumerator.Get());
                 ticksSinceDeviceCheck = 0;
-                ticksUntilRetry = 2 * TICKS_PER_SECOND;
+                ticksUntilRetry = 2 * as::TICKS_PER_SECOND;
             }
 
             double sumSquares = 0.0;
@@ -497,7 +482,7 @@ void AudioThread()
             }
 
             // Follow the user when they switch output device (e.g. speakers -> headphones).
-            if (open && ++ticksSinceDeviceCheck >= 2 * TICKS_PER_SECOND)
+            if (open && ++ticksSinceDeviceCheck >= 2 * as::TICKS_PER_SECOND)
             {
                 ticksSinceDeviceCheck = 0;
                 if (DefaultDeviceId(enumerator.Get()) != capture.DeviceId())
@@ -515,30 +500,17 @@ void AudioThread()
             {
                 bool muted = false;
                 double volumeDb = capture.VolumeDb(muted);
-                double rms = std::sqrt(sumSquares / (double)count);
-                if (!muted && rms > 1e-5)
-                {
-                    double dbfs = 20.0 * std::log10(rms);
-                    level = std::clamp(dbfs + volumeDb + LOUDNESS_OFFSETS[g_loudness.load()], 0.0, 140.0);
-                }
+                level = as::EstimateLevel(std::sqrt(sumSquares / (double)count), volumeDb, muted, g_loudness);
             }
 
-            smoothed += (level - smoothed) * (level > smoothed ? 0.6 : 0.2);
-            if (smoothed < 0.5)
-                smoothed = 0.0;
-            g_db = smoothed;
+            double shown = smoother.Step(level);
+            g_db = shown;
 
             std::lock_guard<std::mutex> lk(g.lock);
-            g.history.push_back((float)smoothed);
-            while (g.history.size() > HISTORY_LEN)
+            g.history.push_back((float)shown);
+            while (g.history.size() > as::HISTORY_LEN)
                 g.history.pop_front();
-            if (level > 0.0)
-            {
-                g.exposure += dt / (SafeHours(level) * 3600.0);
-                if (level >= 40.0)
-                    g.listenSeconds += dt;
-                g.peakDb = std::max(g.peakDb, smoothed);
-            }
+            g.tracker.Tick(level, shown, dt, g_spotifyPlaying);
         }
         capture.Close();
     }
@@ -548,33 +520,6 @@ void AudioThread()
 // ---------------------------------------------------------------------------
 // Look and feel
 // ---------------------------------------------------------------------------
-
-enum Zone { ZONE_PAUSED, ZONE_SILENT, ZONE_SAFE, ZONE_LOUD, ZONE_HARMFUL };
-
-Zone ZoneFor(double db)
-{
-    if (g_paused)
-        return ZONE_PAUSED;
-    if (!g_deviceOk || db < 1.0)
-        return ZONE_SILENT;
-    if (db < 80.0)
-        return ZONE_SAFE;
-    if (db < 90.0)
-        return ZONE_LOUD;
-    return ZONE_HARMFUL;
-}
-
-const wchar_t* ZoneLabel(Zone z)
-{
-    switch (z)
-    {
-    case ZONE_PAUSED: return L"PAUSED";
-    case ZONE_SILENT: return L"SILENT";
-    case ZONE_SAFE: return L"SAFE";
-    case ZONE_LOUD: return L"LOUD";
-    default: return L"HARMFUL";
-    }
-}
 
 const G::Color COLOR_BG(255, 18, 20, 26);
 const G::Color COLOR_CARD(255, 29, 33, 42);
@@ -586,14 +531,15 @@ const G::Color COLOR_GREEN(255, 61, 220, 132);
 const G::Color COLOR_AMBER(255, 255, 176, 32);
 const G::Color COLOR_RED(255, 255, 90, 95);
 const G::Color COLOR_GREY(255, 138, 143, 152);
+const G::Color COLOR_SPOTIFY(255, 30, 215, 96);
 
-G::Color ZoneColor(Zone z)
+G::Color ZoneColor(as::Zone z)
 {
     switch (z)
     {
-    case ZONE_SAFE: return COLOR_GREEN;
-    case ZONE_LOUD: return COLOR_AMBER;
-    case ZONE_HARMFUL: return COLOR_RED;
+    case as::Zone::Safe: return COLOR_GREEN;
+    case as::Zone::Loud: return COLOR_AMBER;
+    case as::Zone::Harmful: return COLOR_RED;
     default: return COLOR_GREY;
     }
 }
@@ -650,12 +596,24 @@ void DrawLabelRight(G::Graphics& gr, const std::wstring& text, const G::Font& fo
     DrawLabel(gr, text, font, color, right - TextWidth(gr, text, font), y);
 }
 
+// Draws text on one line, ending in "..." if it doesn't fit in maxWidth.
+void DrawLabelClipped(G::Graphics& gr, const std::wstring& text, const G::Font& font,
+                      const G::Color& color, float x, float y, float maxWidth)
+{
+    G::StringFormat format;
+    format.SetTrimming(G::StringTrimmingEllipsisCharacter);
+    format.SetFormatFlags(G::StringFormatFlagsNoWrap);
+    G::SolidBrush brush(color);
+    G::RectF box(x, y, maxWidth, font.GetHeight(&gr) + 2.0f);
+    gr.DrawString(text.c_str(), (INT)text.size(), &font, box, &format, &brush);
+}
+
 // ---------------------------------------------------------------------------
 // Tray icon
 // ---------------------------------------------------------------------------
 
 // A ring that fills up with today's allowance around a dot showing the current level.
-HICON MakeTrayIcon(Zone zone, double fraction)
+HICON MakeTrayIcon(as::Zone zone, double fraction)
 {
     int size = GetSystemMetrics(SM_CXSMICON);
     G::Bitmap bmp(size, size, PixelFormat32bppARGB);
@@ -702,8 +660,8 @@ void AddTrayIcon()
 
 void UpdateTray(double db, double fraction)
 {
-    Zone zone = ZoneFor(db);
-    int key = zone * 1000 + (int)(std::min(fraction, 1.0) * 24.0);
+    as::Zone zone = as::ZoneFor(db, g_paused, g_deviceOk);
+    int key = (int)zone * 1000 + (int)(std::min(fraction, 1.0) * 24.0);
     if (key != g_trayIconKey)
     {
         HICON icon = MakeTrayIcon(zone, fraction);
@@ -719,28 +677,30 @@ void UpdateTray(double db, double fraction)
     }
 
     std::wstring tip = std::wstring(APP_NAME) + L"\n";
-    if (zone == ZONE_PAUSED)
+    if (zone == as::Zone::Paused)
         tip += L"Paused";
-    else if (zone == ZONE_SILENT)
+    else if (zone == as::Zone::Silent)
         tip += L"Nothing playing";
     else
-        tip += std::to_wstring((int)std::lround(db)) + L" dB (" + ZoneLabel(zone) + L")";
+        tip += std::to_wstring((int)std::lround(db)) + L" dB (" + Wide(as::ZoneLabel(zone)) + L")";
     tip += L"\n" + std::to_wstring((int)(fraction * 100.0)) + L"% of today's allowance used";
+    if (g_set.spotify && g_nowPlaying.playing)
+        tip += L"\nSpotify: " + Wide(as::DescribeTrack(g_nowPlaying));
 
     g_nid.uFlags = NIF_ICON | NIF_TIP;
     wcsncpy_s(g_nid.szTip, tip.c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
-void Notify(const std::wstring& title, const std::wstring& text)
+void Notify(const as::Alert& alert)
 {
     if (!g_set.notifications)
         return;
     NOTIFYICONDATAW n = g_nid;
     n.uFlags = NIF_INFO;
     n.dwInfoFlags = NIIF_WARNING;
-    wcsncpy_s(n.szInfoTitle, title.c_str(), _TRUNCATE);
-    wcsncpy_s(n.szInfo, text.c_str(), _TRUNCATE);
+    wcsncpy_s(n.szInfoTitle, Wide(alert.title).c_str(), _TRUNCATE);
+    wcsncpy_s(n.szInfo, Wide(alert.text).c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &n);
 }
 
@@ -748,145 +708,171 @@ void Notify(const std::wstring& title, const std::wstring& text)
 // Dashboard
 // ---------------------------------------------------------------------------
 
-void PaintDashboard(HWND hwnd, HDC hdc)
+as::DashboardModel BuildModel()
+{
+    as::DashboardModel m;
+    {
+        std::lock_guard<std::mutex> lk(g.lock);
+        m.stats = g.tracker.stats;
+        m.history.assign(g.history.begin(), g.history.end());
+    }
+    m.db = g_db;
+    m.paused = g_paused;
+    m.deviceOk = g_deviceOk;
+    m.spotifyEnabled = g_set.spotify;
+    m.spotify = g_nowPlaying;
+    return m;
+}
+
+// Draws the dashboard at scale k (1.0 = 96 DPI) into a W x H pixel area.
+void PaintDashboard(G::Graphics& gr, float W, float H, float k, const as::DashboardModel& m)
+{
+    as::Zone zone = as::ModelZone(m);
+    G::Color zoneColor = ZoneColor(zone);
+    bool noNumber = zone == as::Zone::Silent || zone == as::Zone::Paused;
+
+    gr.SetSmoothingMode(G::SmoothingModeAntiAlias);
+    gr.SetTextRenderingHint(G::TextRenderingHintClearTypeGridFit);
+    gr.Clear(COLOR_BG);
+
+    G::FontFamily family(L"Segoe UI");
+    G::Font fontBig(&family, 52 * k, G::FontStyleBold, G::UnitPixel);
+    G::Font fontUnit(&family, 20 * k, G::FontStyleRegular, G::UnitPixel);
+    G::Font fontLabel(&family, 12 * k, G::FontStyleRegular, G::UnitPixel);
+    G::Font fontLabelBold(&family, 12 * k, G::FontStyleBold, G::UnitPixel);
+    G::Font fontBody(&family, 13 * k, G::FontStyleRegular, G::UnitPixel);
+    G::Font fontValue(&family, 15 * k, G::FontStyleBold, G::UnitPixel);
+    G::Font fontTiny(&family, 11 * k, G::FontStyleRegular, G::UnitPixel);
+
+    float margin = 20 * k;
+
+    // Header: current level and zone pill.
+    DrawLabel(gr, L"CURRENT LEVEL", fontLabelBold, COLOR_MUTED, margin, 16 * k);
+    std::wstring number = noNumber ? L"--" : std::to_wstring((int)std::lround(m.db));
+    DrawLabel(gr, number, fontBig, COLOR_TEXT, margin - 4 * k, 28 * k);
+    DrawLabel(gr, L"dB", fontUnit, COLOR_MUTED, margin + TextWidth(gr, number, fontBig) - 10 * k, 58 * k);
+
+    std::wstring pill = Wide(as::ZoneLabel(zone));
+    float pillW = TextWidth(gr, pill, fontLabelBold) + 22 * k;
+    G::RectF pillRect(W - margin - pillW, 44 * k, pillW, 26 * k);
+    FillRoundRect(gr, WithAlpha(zoneColor, 45), pillRect, 13 * k);
+    DrawLabel(gr, pill, fontLabelBold, zoneColor, pillRect.X + 11 * k, pillRect.Y + 5 * k);
+
+    DrawLabel(gr, Wide(as::StatusLine(m)), fontBody, COLOR_TEXT, margin, 96 * k);
+
+    // Spotify row.
+    std::wstring spotify = Wide(as::SpotifyLine(m));
+    if (!spotify.empty())
+    {
+        G::SolidBrush dot(m.spotify.playing ? COLOR_SPOTIFY : COLOR_GREY);
+        gr.FillEllipse(&dot, margin, 122 * k, 12 * k, 12 * k);
+        DrawLabelClipped(gr, spotify, fontBody, m.spotify.playing ? COLOR_TEXT : COLOR_MUTED,
+                         margin + 18 * k, 119 * k, W - 2 * margin - 18 * k);
+    }
+
+    // Allowance card.
+    G::RectF card(margin, 150 * k, W - 2 * margin, 82 * k);
+    FillRoundRect(gr, COLOR_CARD, card, 10 * k);
+    float inner = card.X + 14 * k, innerRight = card.GetRight() - 14 * k;
+    G::Color allowanceColor = AllowanceColor(m.stats.exposure);
+    DrawLabel(gr, L"Today's allowance used", fontLabel, COLOR_MUTED, inner, card.Y + 12 * k);
+    DrawLabelRight(gr, std::to_wstring((int)(m.stats.exposure * 100.0)) + L"%", fontValue, allowanceColor,
+                   innerRight, card.Y + 9 * k);
+    G::RectF bar(inner, card.Y + 36 * k, innerRight - inner, 10 * k);
+    FillRoundRect(gr, COLOR_TRACK, bar, 5 * k);
+    float filled = (float)std::min(m.stats.exposure, 1.0) * bar.Width;
+    if (filled > 0.5f)
+        FillRoundRect(gr, allowanceColor, G::RectF(bar.X, bar.Y, std::max(filled, bar.Height), bar.Height), 5 * k);
+    DrawLabel(gr, Wide(as::StatsLine(m)), fontLabel, COLOR_MUTED, inner, card.Y + 56 * k);
+
+    // History graph card.
+    G::RectF graphCard(margin, 244 * k, W - 2 * margin, H - 244 * k - 40 * k);
+    FillRoundRect(gr, COLOR_CARD, graphCard, 10 * k);
+    DrawLabel(gr, L"Last 2 minutes", fontLabel, COLOR_MUTED, inner, graphCard.Y + 10 * k);
+
+    G::RectF plot(inner, graphCard.Y + 34 * k, innerRight - inner, graphCard.Height - 46 * k);
+    const float minDb = 30.0f, maxDb = 110.0f;
+    auto yFor = [&](float v) {
+        float t = (std::clamp(v, minDb, maxDb) - minDb) / (maxDb - minDb);
+        return plot.GetBottom() - t * plot.Height;
+    };
+
+    G::Pen baseline(COLOR_TRACK, 1.0f * k);
+    gr.DrawLine(&baseline, plot.X, plot.GetBottom(), plot.GetRight(), plot.GetBottom());
+    G::Pen refLine(WithAlpha(COLOR_RED, 150), 1.0f * k);
+    refLine.SetDashStyle(G::DashStyleDash);
+    float refY = yFor((float)as::REF_DB);
+    gr.DrawLine(&refLine, plot.X, refY, plot.GetRight(), refY);
+    DrawLabelRight(gr, L"85 dB", fontTiny, WithAlpha(COLOR_RED, 200), plot.GetRight(), refY - 16 * k);
+
+    if (m.history.size() >= 2)
+    {
+        std::vector<G::PointF> points;
+        points.reserve(m.history.size() + 2);
+        float step = plot.Width / (float)(as::HISTORY_LEN - 1);
+        float x0 = plot.GetRight() - step * (float)(m.history.size() - 1);
+        for (size_t i = 0; i < m.history.size(); i++)
+            points.emplace_back(x0 + step * (float)i, yFor(m.history[i]));
+
+        G::Color lineColor = noNumber ? COLOR_GREEN : zoneColor;
+        std::vector<G::PointF> area(points);
+        area.emplace_back(points.back().X, plot.GetBottom());
+        area.emplace_back(points.front().X, plot.GetBottom());
+        G::SolidBrush areaBrush(WithAlpha(lineColor, 40));
+        gr.FillPolygon(&areaBrush, area.data(), (INT)area.size());
+        G::Pen line(lineColor, 2.0f * k);
+        line.SetLineJoin(G::LineJoinRound);
+        gr.DrawLines(&line, points.data(), (INT)points.size());
+    }
+
+    DrawLabel(gr, L"Right-click for options  \x00B7  \x2191/\x2193 change opacity  \x00B7  Esc hides",
+              fontTiny, COLOR_DIM, margin, H - 28 * k);
+}
+
+void PaintDashboardWindow(HWND hwnd, HDC hdc)
 {
     RECT rc;
     GetClientRect(hwnd, &rc);
     int width = rc.right, height = rc.bottom;
     if (width <= 0 || height <= 0)
         return;
-    float k = GetDpiForWindow(hwnd) / 96.0f;
-    float W = (float)width, H = (float)height;
-
-    std::vector<float> history;
-    double exposure, listen, peak;
-    {
-        std::lock_guard<std::mutex> lk(g.lock);
-        history.assign(g.history.begin(), g.history.end());
-        exposure = g.exposure;
-        listen = g.listenSeconds;
-        peak = g.peakDb;
-    }
-    double db = g_db;
-    Zone zone = ZoneFor(db);
-    G::Color zoneColor = ZoneColor(zone);
 
     HDC mem = CreateCompatibleDC(hdc);
     HBITMAP bitmap = CreateCompatibleBitmap(hdc, width, height);
     HGDIOBJ oldBitmap = SelectObject(mem, bitmap);
     {
         G::Graphics gr(mem);
-        gr.SetSmoothingMode(G::SmoothingModeAntiAlias);
-        gr.SetTextRenderingHint(G::TextRenderingHintClearTypeGridFit);
-        gr.Clear(COLOR_BG);
-
-        G::FontFamily family(L"Segoe UI");
-        G::Font fontBig(&family, 52 * k, G::FontStyleBold, G::UnitPixel);
-        G::Font fontUnit(&family, 20 * k, G::FontStyleRegular, G::UnitPixel);
-        G::Font fontLabel(&family, 12 * k, G::FontStyleRegular, G::UnitPixel);
-        G::Font fontLabelBold(&family, 12 * k, G::FontStyleBold, G::UnitPixel);
-        G::Font fontBody(&family, 13 * k, G::FontStyleRegular, G::UnitPixel);
-        G::Font fontValue(&family, 15 * k, G::FontStyleBold, G::UnitPixel);
-        G::Font fontTiny(&family, 11 * k, G::FontStyleRegular, G::UnitPixel);
-
-        float margin = 20 * k;
-
-        // Header: current level and zone pill.
-        DrawLabel(gr, L"CURRENT LEVEL", fontLabelBold, COLOR_MUTED, margin, 16 * k);
-        std::wstring number = (zone == ZONE_SILENT || zone == ZONE_PAUSED)
-                                  ? L"--"
-                                  : std::to_wstring((int)std::lround(db));
-        DrawLabel(gr, number, fontBig, COLOR_TEXT, margin - 4 * k, 28 * k);
-        DrawLabel(gr, L"dB", fontUnit, COLOR_MUTED, margin + TextWidth(gr, number, fontBig) - 10 * k, 58 * k);
-
-        std::wstring pill = ZoneLabel(zone);
-        float pillW = TextWidth(gr, pill, fontLabelBold) + 22 * k;
-        G::RectF pillRect(W - margin - pillW, 44 * k, pillW, 26 * k);
-        FillRoundRect(gr, WithAlpha(zoneColor, 45), pillRect, 13 * k);
-        DrawLabel(gr, pill, fontLabelBold, zoneColor, pillRect.X + 11 * k, pillRect.Y + 5 * k);
-
-        // Status sentence.
-        std::wstring status;
-        if (zone == ZONE_PAUSED)
-            status = L"Monitoring is paused; exposure isn't being counted.";
-        else if (!g_deviceOk)
-            status = L"No audio output device found.";
-        else if (zone == ZONE_SILENT)
-            status = L"Nothing is playing right now.";
-        else if (exposure >= 1.0)
-            status = L"Daily allowance used up. Take a break or turn it down.";
-        else if (db < 70.0)
-            status = L"Comfortable level; it barely touches your allowance.";
-        else
-            status = L"At this level: " + FormatDuration((1.0 - exposure) * SafeHours(db)) +
-                     L" of safe listening left today.";
-        DrawLabel(gr, status, fontBody, COLOR_TEXT, margin, 96 * k);
-
-        // Allowance card.
-        G::RectF card(margin, 126 * k, W - 2 * margin, 82 * k);
-        FillRoundRect(gr, COLOR_CARD, card, 10 * k);
-        float inner = card.X + 14 * k, innerRight = card.GetRight() - 14 * k;
-        G::Color allowanceColor = AllowanceColor(exposure);
-        DrawLabel(gr, L"Today's allowance used", fontLabel, COLOR_MUTED, inner, card.Y + 12 * k);
-        DrawLabelRight(gr, std::to_wstring((int)(exposure * 100.0)) + L"%", fontValue, allowanceColor,
-                       innerRight, card.Y + 9 * k);
-        G::RectF bar(inner, card.Y + 36 * k, innerRight - inner, 10 * k);
-        FillRoundRect(gr, COLOR_TRACK, bar, 5 * k);
-        float filled = (float)std::min(exposure, 1.0) * bar.Width;
-        if (filled > 0.5f)
-            FillRoundRect(gr, allowanceColor, G::RectF(bar.X, bar.Y, std::max(filled, bar.Height), bar.Height), 5 * k);
-        std::wstring stats = L"Listening today: " + FormatDuration(listen / 3600.0);
-        if (peak > 0.0)
-            stats += L"    Peak: " + std::to_wstring((int)std::lround(peak)) + L" dB";
-        DrawLabel(gr, stats, fontLabel, COLOR_MUTED, inner, card.Y + 56 * k);
-
-        // History graph card.
-        G::RectF graphCard(margin, 220 * k, W - 2 * margin, H - 220 * k - 40 * k);
-        FillRoundRect(gr, COLOR_CARD, graphCard, 10 * k);
-        DrawLabel(gr, L"Last 2 minutes", fontLabel, COLOR_MUTED, inner, graphCard.Y + 10 * k);
-
-        G::RectF plot(inner, graphCard.Y + 34 * k, innerRight - inner, graphCard.Height - 46 * k);
-        const float minDb = 30.0f, maxDb = 110.0f;
-        auto yFor = [&](float v) {
-            float t = (std::clamp(v, minDb, maxDb) - minDb) / (maxDb - minDb);
-            return plot.GetBottom() - t * plot.Height;
-        };
-
-        G::Pen baseline(COLOR_TRACK, 1.0f * k);
-        gr.DrawLine(&baseline, plot.X, plot.GetBottom(), plot.GetRight(), plot.GetBottom());
-        G::Pen refLine(WithAlpha(COLOR_RED, 150), 1.0f * k);
-        refLine.SetDashStyle(G::DashStyleDash);
-        float refY = yFor((float)REF_DB);
-        gr.DrawLine(&refLine, plot.X, refY, plot.GetRight(), refY);
-        DrawLabelRight(gr, L"85 dB", fontTiny, WithAlpha(COLOR_RED, 200), plot.GetRight(), refY - 16 * k);
-
-        if (history.size() >= 2)
-        {
-            std::vector<G::PointF> points;
-            points.reserve(history.size() + 2);
-            float step = plot.Width / (float)(HISTORY_LEN - 1);
-            float x0 = plot.GetRight() - step * (float)(history.size() - 1);
-            for (size_t i = 0; i < history.size(); i++)
-                points.emplace_back(x0 + step * (float)i, yFor(history[i]));
-
-            G::Color lineColor = zone == ZONE_SILENT || zone == ZONE_PAUSED ? COLOR_GREEN : zoneColor;
-            std::vector<G::PointF> area(points);
-            area.emplace_back(points.back().X, plot.GetBottom());
-            area.emplace_back(points.front().X, plot.GetBottom());
-            G::SolidBrush areaBrush(WithAlpha(lineColor, 40));
-            gr.FillPolygon(&areaBrush, area.data(), (INT)area.size());
-            G::Pen line(lineColor, 2.0f * k);
-            line.SetLineJoin(G::LineJoinRound);
-            gr.DrawLines(&line, points.data(), (INT)points.size());
-        }
-
-        DrawLabel(gr, L"Right-click for options  \x00B7  \x2191/\x2193 change opacity  \x00B7  Esc hides",
-                  fontTiny, COLOR_DIM, margin, H - 28 * k);
+        PaintDashboard(gr, (float)width, (float)height, GetDpiForWindow(hwnd) / 96.0f, BuildModel());
     }
     BitBlt(hdc, 0, 0, width, height, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBitmap);
     DeleteObject(bitmap);
     DeleteDC(mem);
+}
+
+// Renders the dashboard with sample data to a PNG (used by CI for screenshots).
+bool RenderDashboardPng(const wchar_t* path)
+{
+    const float scale = 2.0f;
+    G::Bitmap bmp((INT)(DASHBOARD_WIDTH * scale), (INT)(DASHBOARD_HEIGHT * scale), PixelFormat32bppARGB);
+    {
+        G::Graphics gr(&bmp);
+        PaintDashboard(gr, DASHBOARD_WIDTH * scale, DASHBOARD_HEIGHT * scale, scale, as::DemoModel());
+    }
+
+    UINT count = 0, size = 0;
+    G::GetImageEncodersSize(&count, &size);
+    if (size == 0)
+        return false;
+    std::vector<BYTE> buffer(size);
+    auto* encoders = reinterpret_cast<G::ImageCodecInfo*>(buffer.data());
+    G::GetImageEncoders(count, size, encoders);
+    for (UINT i = 0; i < count; i++)
+    {
+        if (wcscmp(encoders[i].MimeType, L"image/png") == 0)
+            return bmp.Save(path, &encoders[i].Clsid, nullptr) == G::Ok;
+    }
+    return false;
 }
 
 void ApplyOpacity()
@@ -910,7 +896,7 @@ void CreateDashboard()
 
     // Size for the monitor's DPI and park it above the tray, like other tray apps.
     UINT dpi = GetDpiForWindow(g_dash);
-    RECT r = { 0, 0, MulDiv(440, dpi, 96), MulDiv(420, dpi, 96) };
+    RECT r = { 0, 0, MulDiv(DASHBOARD_WIDTH, dpi, 96), MulDiv(DASHBOARD_HEIGHT, dpi, 96) };
     AdjustWindowRectExForDpi(&r, style, FALSE, exStyle, dpi);
     int w = r.right - r.left, h = r.bottom - r.top, gap = MulDiv(16, dpi, 96);
     RECT work;
@@ -927,7 +913,7 @@ void ShowDashboard()
         return;
     ShowWindow(g_dash, SW_SHOWNORMAL);
     SetForegroundWindow(g_dash);
-    SetTimer(g_dash, TIMER_REDRAW, 250, nullptr);
+    SetTimer(g_dash, TIMER_REDRAW, 1000 / as::TICKS_PER_SECOND, nullptr);
     InvalidateRect(g_dash, nullptr, FALSE);
 }
 
@@ -957,7 +943,7 @@ void ShowMenu(HWND owner)
     AppendMenuW(loud, MF_STRING, ID_LOUD_0, L"Quiet (earbuds, low-sensitivity speakers)");
     AppendMenuW(loud, MF_STRING, ID_LOUD_1, L"Typical");
     AppendMenuW(loud, MF_STRING, ID_LOUD_2, L"Loud (sensitive headphones, big speakers)");
-    CheckMenuRadioItem(loud, ID_LOUD_0, ID_LOUD_2, ID_LOUD_0 + g_loudness, MF_BYCOMMAND);
+    CheckMenuRadioItem(loud, ID_LOUD_0, ID_LOUD_2, ID_LOUD_0 + g_set.loudness, MF_BYCOMMAND);
 
     bool visible = g_dash && IsWindowVisible(g_dash) && !IsIconic(g_dash);
     HMENU menu = CreatePopupMenu();
@@ -966,6 +952,7 @@ void ShowMenu(HWND owner)
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (g_paused ? MF_CHECKED : 0), ID_PAUSE, L"Pause monitoring");
     AppendMenuW(menu, MF_STRING | (g_set.notifications ? MF_CHECKED : 0), ID_NOTIFY, L"Warning notifications");
+    AppendMenuW(menu, MF_STRING | (g_set.spotify ? MF_CHECKED : 0), ID_SPOTIFY, L"Show Spotify");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)loud, L"My headphones/speakers are");
     AppendMenuW(menu, MF_STRING | (g_set.topmost ? MF_CHECKED : 0), ID_TOPMOST, L"Keep dashboard on top");
     AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : 0), ID_STARTUP, L"Start with Windows");
@@ -997,10 +984,15 @@ void HandleCommand(UINT id)
         g_set.notifications = !g_set.notifications;
         SaveState();
         break;
+    case ID_SPOTIFY:
+        g_set.spotify = !g_set.spotify;
+        SaveState();
+        break;
     case ID_LOUD_0:
     case ID_LOUD_1:
     case ID_LOUD_2:
-        g_loudness = (int)(id - ID_LOUD_0);
+        g_set.loudness = (int)(id - ID_LOUD_0);
+        g_loudness = g_set.loudness;
         SaveState();
         break;
     case ID_TOPMOST:
@@ -1020,23 +1012,22 @@ void HandleCommand(UINT id)
         {
             {
                 std::lock_guard<std::mutex> lk(g.lock);
-                g.exposure = 0.0;
-                g.listenSeconds = 0.0;
-                g.peakDb = 0.0;
+                g.tracker.Reset();
             }
-            g_alertLevel = 0;
             SaveState();
         }
         break;
     case ID_ABOUT:
         MessageBoxW(g_dash && IsWindowVisible(g_dash) ? g_dash : nullptr,
-                    L"AudioSentinel 1.1\n\n"
+                    L"AudioSentinel 1.2\n\n"
                     L"Listens to what your PC plays and estimates how loud it is. Your daily "
                     L"allowance follows the NIOSH guideline: 85 dB for 8 hours, halved for every "
                     L"3 dB louder (88 dB = 4 h, 91 dB = 2 h, ...).\n\n"
                     L"Levels are estimates: pick how loud your headphones or speakers are under "
                     L"\"My headphones/speakers are\" to calibrate. You get a warning at 50%, 80% "
                     L"and 100% of the allowance, and when audio is very loud.\n\n"
+                    L"While Spotify plays, the dashboard shows the track and how much of today's "
+                    L"exposure came from Spotify.\n\n"
                     L"The counter resets every day at midnight.\n"
                     L"https://github.com/Afaguayo/AudioSentinel",
                     L"About AudioSentinel", MB_OK | MB_ICONINFORMATION);
@@ -1048,70 +1039,32 @@ void HandleCommand(UINT id)
 }
 
 // ---------------------------------------------------------------------------
-// Once-a-second housekeeping: day rollover, warnings, tray, autosave
+// Once-a-second housekeeping: Spotify, day rollover, warnings, tray, autosave
 // ---------------------------------------------------------------------------
 
 void OnTick()
 {
     static int ticks = 0;
-    std::wstring today = Today();
+
+    g_nowPlaying = g_set.spotify ? ReadSpotify() : as::NowPlaying{};
+    g_spotifyPlaying = g_nowPlaying.playing;
+
+    double db = g_db;
+    std::vector<as::Alert> alerts;
     double fraction;
     {
         std::lock_guard<std::mutex> lk(g.lock);
-        if (g.date != today)
-        {
-            g.date = today;
-            g.exposure = 0.0;
-            g.listenSeconds = 0.0;
-            g.peakDb = 0.0;
-            g_alertLevel = 0;
-        }
-        fraction = g.exposure;
+        g.tracker.Rollover(as::Today());
+        alerts = g_alerts.Update(g.tracker.stats, db, g_paused, g_nowPlaying.playing,
+                                 GetTickCount64() / 1000.0);
+        fraction = g.tracker.stats.exposure;
     }
-    double db = g_db;
-    ULONGLONG now = GetTickCount64();
-
-    // Allowance milestones; only the highest one crossed is announced.
-    int reached = g_alertLevel;
-    while (reached < 3 && fraction >= ALERT_MARKS[reached])
-        reached++;
-    if (reached > g_alertLevel)
-    {
-        g_alertLevel = reached;
-        if (reached == 3)
-        {
-            Notify(L"Daily safe-listening limit reached",
-                   L"More loud listening today risks hearing damage. Take a break or turn the volume down a lot.");
-            g_lastOverAlert = now;
-        }
-        else
-        {
-            std::wstring pct = std::to_wstring((int)(ALERT_MARKS[reached - 1] * 100));
-            Notify(pct + L"% of today's allowance used",
-                   L"You have used " + pct + L"% of today's safe-listening allowance. Turning the volume down makes the rest last much longer.");
-        }
-        SaveState();
-    }
-    else if (fraction >= 1.0 && db >= 70.0 && now - g_lastOverAlert > 30ull * 60 * 1000)
-    {
-        Notify(L"Still over today's limit",
-               L"You are " + std::to_wstring((int)(fraction * 100)) + L"% through today's allowance. Consider a break.");
-        g_lastOverAlert = now;
-    }
-
-    // Sustained very loud audio.
-    g_loudSeconds = (!g_paused && db >= LOUD_ALERT_DB) ? g_loudSeconds + 1 : 0;
-    if (g_loudSeconds >= 10 && (g_lastLoudAlert == 0 || now - g_lastLoudAlert > 10ull * 60 * 1000))
-    {
-        Notify(L"Very loud: " + std::to_wstring((int)std::lround(db)) + L" dB",
-               L"At this volume your whole daily allowance lasts only about " +
-                   FormatDuration(SafeHours(db)) + L". Turn it down.");
-        g_lastLoudAlert = now;
-    }
+    for (const auto& alert : alerts)
+        Notify(alert);
 
     UpdateTray(db, fraction);
 
-    if (++ticks % 30 == 0)
+    if (!alerts.empty() || ++ticks % 30 == 0)
         SaveState();
 }
 
@@ -1134,7 +1087,7 @@ LRESULT CALLBACK DashboardProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
-        PaintDashboard(hwnd, hdc);
+        PaintDashboardWindow(hwnd, hdc);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1236,6 +1189,25 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int)
 {
     g_inst = inst;
 
+    // Headless mode for CI: draw the dashboard with sample data and exit.
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    for (int i = 1; argv && i + 1 < argc; i++)
+    {
+        if (wcscmp(argv[i], L"--render-dashboard") == 0)
+        {
+            G::GdiplusStartupInput input;
+            ULONG_PTR token = 0;
+            G::GdiplusStartup(&token, &input, nullptr);
+            bool ok = RenderDashboardPng(argv[i + 1]);
+            G::GdiplusShutdown(token);
+            LocalFree(argv);
+            return ok ? 0 : 1;
+        }
+    }
+    if (argv)
+        LocalFree(argv);
+
     // One instance only; a second launch just opens the running one's dashboard.
     HANDLE mutex = CreateMutexW(nullptr, FALSE, MUTEX_NAME);
     if (GetLastError() == ERROR_ALREADY_EXISTS)
@@ -1254,7 +1226,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int)
     ULONG_PTR gdiplusToken = 0;
     G::GdiplusStartup(&gdiplusToken, &gdiplusInput, nullptr);
 
-    g_ini = StateDir() + L"\\AudioSentinel.ini";
+    g_ini = std::make_unique<as::IniFile>(std::filesystem::path(StateDir()) / L"AudioSentinel.ini");
     LoadState();
 
     HICON appIcon = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APP));

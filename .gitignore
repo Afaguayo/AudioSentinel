@@ -365,3 +365,6 @@ FodyWeavers.xsd
 exposure.dat
 # AudioSentinel
 dist/
+build/
+build-tests/
+dashboard-*.png
