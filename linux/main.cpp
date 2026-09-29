@@ -106,6 +106,12 @@ public:
     std::atomic<int> loudness{ 1 };
     SinkVolume volume;
 
+    std::string LastError()
+    {
+        std::lock_guard<std::mutex> lk(errorLock_);
+        return error_;
+    }
+
 private:
     void Run()
     {
@@ -116,13 +122,17 @@ private:
         {
             if (!capture.IsOpen() && !capture.Open())
             {
+                SetError(capture.LastError());
                 deviceOk = false;
                 db = 0.0;
-                for (int i = 0; i < 20 && running_; i++)  // retry every 2 s
+                // Retry quickly at first, then every 2 s.
+                int waits = failures_++ < 5 ? 2 : 20;
+                for (int i = 0; i < waits && running_; i++)
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 last = std::chrono::steady_clock::now();
                 continue;
             }
+            failures_ = 0;
 
             double reading = 0.0;
             bool ok = capture.ReadRms(1.0 / as::TICKS_PER_SECOND, reading);
@@ -132,6 +142,7 @@ private:
             last = now;
             if (!ok)
             {
+                SetError(capture.LastError());
                 capture.Close();
                 deviceOk = false;
                 continue;
@@ -153,8 +164,17 @@ private:
         }
     }
 
+    void SetError(const std::string& e)
+    {
+        std::lock_guard<std::mutex> lk(errorLock_);
+        error_ = e;
+    }
+
     std::thread thread_;
     std::atomic<bool> running_{ false };
+    int failures_ = 0;
+    std::mutex errorLock_;
+    std::string error_;
 };
 
 // ---------------------------------------------------------------------------
@@ -656,6 +676,7 @@ int RunProbe(double seconds, int loudness)
     }
     bool ok = monitor.deviceOk;
     std::printf("device_ok=%d\n", ok ? 1 : 0);
+    std::printf("capture_error=%s\n", monitor.LastError().c_str());
     std::printf("server=%s\n", monitor.volume.ServerName().c_str());
     std::printf("sink=%s\n", monitor.volume.SinkName().c_str());
     std::printf("volume_db=%.2f\n", monitor.volume.EffectiveVolumeDb());

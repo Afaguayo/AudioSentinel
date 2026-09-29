@@ -21,6 +21,7 @@ public:
     bool Open();
     void Close();
     bool IsOpen() const { return stream_ != nullptr; }
+    const std::string& LastError() const { return error_; }
 
     // Blocks for `seconds` of audio and returns its RMS (1.0 = full scale).
     // Returns false when the stream broke and must be reopened.
@@ -28,6 +29,7 @@ public:
 
 private:
     pa_simple* stream_ = nullptr;
+    std::string error_;
 };
 
 // Polls the default sink's volume once a second on a PulseAudio mainloop thread.

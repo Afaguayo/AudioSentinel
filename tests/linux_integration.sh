@@ -14,6 +14,8 @@ trap cleanup EXIT
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; FAILED=1; }
 field() { grep "^$1=" "$2" | cut -d= -f2-; }
+# probe SECONDS OUTFILE: run --probe, show its output, never abort the script
+probe() { "$BIN" --probe "$1" > "$2" || echo "(probe exit code $?)"; sed 's/^/    /' "$2"; }
 # in_range NAME VALUE LOW HIGH
 in_range() {
   if python3 -c "import sys; sys.exit(0 if $3 <= $2 <= $4 else 1)"; then pass "$1 = $2 (expected $3..$4)"
@@ -39,21 +41,21 @@ with wave.open(sys.argv[1], "wb") as w:
 PY
 
 echo "== Silence"
-"$BIN" --probe 3 | tee "$WORK/silence.txt"
+probe 3 "$WORK/silence.txt"
 [ "$(field device_ok "$WORK/silence.txt")" = 1 ] && pass "capture opens the monitor" || fail "capture did not open"
 in_range "silent level_db" "$(field level_db "$WORK/silence.txt")" 0 0
 
 echo "== Tone at 100% volume"
 paplay "$WORK/tone.wav" & PIDS+=($!)
 sleep 1
-"$BIN" --probe 4 | tee "$WORK/full.txt"
+probe 4 "$WORK/full.txt"
 in_range "rms_dbfs" "$(field rms_dbfs "$WORK/full.txt")" -10.0 -8.0
 in_range "level_db" "$(field level_db "$WORK/full.txt")" 90.0 92.0
 
 echo "== Tone at 50% volume (PulseAudio: -18 dB)"
 pactl set-sink-volume test_out 50%
 sleep 0.5
-"$BIN" --probe 4 | tee "$WORK/half.txt"
+probe 4 "$WORK/half.txt"
 # The volume must count exactly once: ~73 dB. 91 would mean it was ignored,
 # 55 that it was counted twice.
 in_range "level_db at 50%" "$(field level_db "$WORK/half.txt")" 71.0 75.0
@@ -61,25 +63,25 @@ in_range "level_db at 50%" "$(field level_db "$WORK/half.txt")" 71.0 75.0
 echo "== Muted"
 pactl set-sink-mute test_out 1
 sleep 0.5
-"$BIN" --probe 3 | tee "$WORK/muted.txt"
+probe 3 "$WORK/muted.txt"
 in_range "muted level_db" "$(field level_db "$WORK/muted.txt")" 0 0
 pactl set-sink-mute test_out 0
 pactl set-sink-volume test_out 100%
 
 echo "== Spotify (fake MPRIS player)"
-"$BIN" --probe 2 > "$WORK/nospotify.txt"
+probe 2 "$WORK/nospotify.txt"
 [ "$(field spotify_running "$WORK/nospotify.txt")" = 0 ] && pass "no Spotify detected when absent" || fail "phantom Spotify"
 
 python3 "$(dirname "$0")/fake_spotify.py" Playing "Daft Punk" "One More Time" & SPOT=$!; PIDS+=($SPOT)
 sleep 1.5
-"$BIN" --probe 3 | tee "$WORK/spotify.txt"
+probe 3 "$WORK/spotify.txt"
 [ "$(field spotify_playing "$WORK/spotify.txt")" = 1 ] && pass "Spotify playing detected" || fail "Spotify playing not detected"
 [ "$(field spotify_track "$WORK/spotify.txt")" = "Daft Punk — One More Time" ] && pass "track read from MPRIS" || fail "wrong track: $(field spotify_track "$WORK/spotify.txt")"
 kill $SPOT
 
 python3 "$(dirname "$0")/fake_spotify.py" Paused "Daft Punk" "One More Time" & SPOT=$!; PIDS+=($SPOT)
 sleep 1.5
-"$BIN" --probe 2 > "$WORK/paused.txt"
+probe 2 "$WORK/paused.txt"
 [ "$(field spotify_running "$WORK/paused.txt")" = 1 ] && [ "$(field spotify_playing "$WORK/paused.txt")" = 0 ] \
   && pass "Spotify paused detected" || fail "Spotify paused state wrong"
 kill $SPOT

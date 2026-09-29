@@ -30,6 +30,7 @@ bool MonitorCapture::Open()
     int error = 0;
     stream_ = pa_simple_new(nullptr, "AudioSentinel", PA_STREAM_RECORD, "@DEFAULT_MONITOR@",
                             "Loudness monitor", &spec, nullptr, &attr, &error);
+    error_ = stream_ ? "" : pa_strerror(error);
     return stream_ != nullptr;
 }
 
@@ -50,7 +51,10 @@ bool MonitorCapture::ReadRms(double seconds, double& rms)
     std::vector<float> buffer(samples);
     int error = 0;
     if (pa_simple_read(stream_, buffer.data(), buffer.size() * sizeof(float), &error) < 0)
+    {
+        error_ = pa_strerror(error);
         return false;
+    }
     double sum = 0.0;
     for (float s : buffer)
         sum += (double)s * s;
