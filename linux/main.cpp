@@ -82,6 +82,7 @@ public:
     void Start()
     {
         volume.Start();
+        startedAt_ = MonotonicSeconds();
         running_ = true;
         thread_ = std::thread([this] { Run(); });
     }
@@ -100,6 +101,7 @@ public:
 
     std::atomic<double> db{ 0.0 };
     std::atomic<double> rms{ 0.0 };  // last raw reading, for --probe
+    std::atomic<double> firstReadAt{ -1.0 };  // seconds from Start() to the first reading
     std::atomic<bool> paused{ false };
     std::atomic<bool> deviceOk{ false };
     std::atomic<bool> spotifyPlaying{ false };
@@ -149,6 +151,8 @@ private:
             }
             deviceOk = true;
             rms = reading;
+            if (firstReadAt < 0)
+                firstReadAt = MonotonicSeconds() - startedAt_;
 
             double level = paused ? 0.0
                                   : as::EstimateLevel(reading, volume.EffectiveVolumeDb(),
@@ -173,6 +177,7 @@ private:
     std::thread thread_;
     std::atomic<bool> running_{ false };
     int failures_ = 0;
+    double startedAt_ = 0.0;
     std::mutex errorLock_;
     std::string error_;
 };
@@ -677,6 +682,7 @@ int RunProbe(double seconds, int loudness)
     bool ok = monitor.deviceOk;
     std::printf("device_ok=%d\n", ok ? 1 : 0);
     std::printf("capture_error=%s\n", monitor.LastError().c_str());
+    std::printf("first_read_s=%.2f\n", monitor.firstReadAt.load());
     std::printf("server=%s\n", monitor.volume.ServerName().c_str());
     std::printf("sink=%s\n", monitor.volume.SinkName().c_str());
     std::printf("volume_db=%.2f\n", monitor.volume.EffectiveVolumeDb());

@@ -69,7 +69,7 @@ pactl set-sink-mute test_out 0
 pactl set-sink-volume test_out 100%
 
 echo "== Spotify (fake MPRIS player)"
-probe 2 "$WORK/nospotify.txt"
+probe 3 "$WORK/nospotify.txt"
 [ "$(field spotify_running "$WORK/nospotify.txt")" = 0 ] && pass "no Spotify detected when absent" || fail "phantom Spotify"
 
 python3 "$(dirname "$0")/fake_spotify.py" Playing "Daft Punk" "One More Time" & SPOT=$!; PIDS+=($SPOT)
@@ -81,14 +81,14 @@ kill $SPOT
 
 python3 "$(dirname "$0")/fake_spotify.py" Paused "Daft Punk" "One More Time" & SPOT=$!; PIDS+=($SPOT)
 sleep 1.5
-probe 2 "$WORK/paused.txt"
+probe 3 "$WORK/paused.txt"
 [ "$(field spotify_running "$WORK/paused.txt")" = 1 ] && [ "$(field spotify_playing "$WORK/paused.txt")" = 0 ] \
   && pass "Spotify paused detected" || fail "Spotify paused state wrong"
 kill $SPOT
 
 echo "== GUI smoke test (Xvfb): starts, runs, saves state, quits on SIGTERM"
-export XDG_STATE_HOME="$WORK/state" XDG_CONFIG_HOME="$WORK/config" XDG_RUNTIME_DIR="$WORK/run"
-mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+# Keep XDG_RUNTIME_DIR: PulseAudio's socket lives there.
+export XDG_STATE_HOME="$WORK/state" XDG_CONFIG_HOME="$WORK/config"
 xvfb-run -a -s "-screen 0 1280x800x24" "$BIN" > "$WORK/gui.log" 2>&1 & GUI=$!; PIDS+=($GUI)
 sleep 8
 if kill -0 $GUI 2>/dev/null; then pass "GUI still running after 8 s"; else fail "GUI exited early"; cat "$WORK/gui.log"; fi
