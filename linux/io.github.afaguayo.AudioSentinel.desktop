@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=AudioSentinel
+GenericName=Safe listening monitor
+Comment=Warns you before you use up your daily safe-listening allowance
+Exec=audiosentinel
+Icon=audiosentinel
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=hearing;volume;loudness;decibel;spotify;
+StartupNotify=false

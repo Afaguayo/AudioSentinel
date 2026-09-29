@@ -1,13 +1,16 @@
 """Draws AudioSentinel.ico (a level gauge) with the standard library only.
 
 Run: python3 tools/make_icon.py  ->  writes AudioSentinel/AudioSentinel.ico
+                                      and linux/audiosentinel.png
 """
 import math
 import struct
 import zlib
 from pathlib import Path
 
-OUT = Path(__file__).resolve().parent.parent / "AudioSentinel" / "AudioSentinel.ico"
+ROOT = Path(__file__).resolve().parent.parent
+OUT = ROOT / "AudioSentinel" / "AudioSentinel.ico"
+PNG_OUT = ROOT / "linux" / "audiosentinel.png"
 SIZES = [16, 24, 32, 48, 64, 256]
 SUPERSAMPLE = 4
 
@@ -112,6 +115,9 @@ def main():
     for s in SIZES:
         px = render(s)
         images.append((s, png_bytes(px) if s >= 256 else bmp_bytes(px)))
+        if s == 256:
+            PNG_OUT.write_bytes(png_bytes(px))
+            print(f"wrote {PNG_OUT}")
 
     out = struct.pack("<HHH", 0, 1, len(images))
     offset = 6 + 16 * len(images)

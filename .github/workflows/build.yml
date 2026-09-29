@@ -11,12 +11,50 @@ permissions:
   contents: write
 
 jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ pkg-config libgtk-3-dev libpulse-dev libnotify-dev \
+            libayatana-appindicator3-dev \
+            pulseaudio pulseaudio-utils dbus-x11 xvfb python3-gi
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Integration tests (PulseAudio, fake Spotify, GUI under Xvfb)
+        run: dbus-run-session -- bash tests/linux_integration.sh build/audiosentinel
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AudioSentinel-linux
+          path: |
+            build/audiosentinel
+            dashboard-linux.png
+
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: microsoft/setup-msbuild@v2
+
+      - name: Unit tests (MSVC)
+        run: |
+          cmake -S . -B build-tests
+          cmake --build build-tests --config Release
+          ctest --test-dir build-tests -C Release --output-on-failure
 
       - name: Pick version
         shell: pwsh
@@ -26,6 +64,12 @@ jobs:
 
       - name: Build exe
         run: msbuild AudioSentinel.sln /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+
+      - name: Dashboard screenshot
+        shell: pwsh
+        run: |
+          $p = Start-Process x64\Release\AudioSentinel.exe -ArgumentList '--render-dashboard', "$PWD\dashboard-windows.png" -Wait -PassThru
+          if ($p.ExitCode -ne 0 -or -not (Test-Path dashboard-windows.png)) { throw "render failed ($($p.ExitCode))" }
 
       - name: Build installer
         shell: pwsh
@@ -40,8 +84,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: AudioSentinel-windows
-          path: dist/*
+          path: |
+            dist/*
+            dashboard-windows.png
 
+      # Releases happen only when a v* tag is pushed.
       - name: Publish release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2

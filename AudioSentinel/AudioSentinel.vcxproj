@@ -69,9 +69,17 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="AudioSentinel.cpp" />
+    <ClCompile Include="..\core\dashboard.cpp" />
+    <ClCompile Include="..\core\exposure.cpp" />
+    <ClCompile Include="..\core\settings.cpp" />
+    <ClCompile Include="..\core\spotify.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="resource.h" />
+    <ClInclude Include="..\core\dashboard.h" />
+    <ClInclude Include="..\core\exposure.h" />
+    <ClInclude Include="..\core\settings.h" />
+    <ClInclude Include="..\core\spotify.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="AudioSentinel.rc" />
